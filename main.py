@@ -55,25 +55,21 @@ class ProcessQuizRequest(BaseModel):
 # === УТИЛИТЫ ===
 
 def normalize_text(s):
-    """Нормализация текста"""
     if not s:
         return ""
     return re.sub(r'\s+', ' ', s).strip().lower()
 
 def extract_full_sentences(text, position, num_sentences=2):
-    """Извлекает полные предложения из текста"""
-    if not text or position < 0:
+    """Извлекает полные предложения"""
+    if not text or position < 0 or position >= len(text):
         return ""
     
-    sentence_start = position
+    sentence_start = 0
     for i in range(position - 1, -1, -1):
-        if text[i] in '.!?\n' and i > 0:
+        if text[i] in '.!?\n':
             sentence_start = i + 1
             break
-        elif i == 0:
-            sentence_start = 0
     
-    # Убираем leading пробелы
     while sentence_start < len(text) and text[sentence_start] in ' \n\r\t':
         sentence_start += 1
     
@@ -87,15 +83,13 @@ def extract_full_sentences(text, position, num_sentences=2):
                 break
     
     if sentences_found < num_sentences:
-        sentence_end = min(len(text), position + 500)
+        sentence_end = min(len(text), position + 400)
     
     result = text[sentence_start:sentence_end].strip()
-    # Очищаем от лишних пробелов и переносов
     result = re.sub(r'\s+', ' ', result)
     return result
 
 def calculate_text_similarity_tfidf(text1, text2):
-    """TF-IDF косинусное сходство"""
     try:
         vectorizer = TfidfVectorizer(min_df=1, stop_words=None)
         tfidf_matrix = vectorizer.fit_transform([text1, text2])
@@ -111,7 +105,6 @@ def calculate_text_similarity_tfidf(text1, text2):
         return intersection / union if union > 0 else 0.0
 
 def calculate_text_similarity_sbert(text1, text2):
-    """SBERT семантическое сходство"""
     if SBERT_MODEL is None:
         return calculate_text_similarity_tfidf(text1, text2)
     
@@ -123,36 +116,22 @@ def calculate_text_similarity_sbert(text1, text2):
         return calculate_text_similarity_tfidf(text1, text2)
 
 def calculate_text_similarity(text1, text2):
-    """Выбираем метод в зависимости от окружения"""
     if IS_LOCAL and SBERT_MODEL is not None:
         return calculate_text_similarity_sbert(text1, text2)
     else:
         return calculate_text_similarity_tfidf(text1, text2)
 
-def extract_ngrams(text, n=3):
-    """Извлекает n-граммы из текста"""
-    words = normalize_text(text).split()
-    if len(words) < n:
-        return [' '.join(words)]
-    return [' '.join(words[i:i+n]) for i in range(len(words)-n+1)]
-
-def calculate_ngram_overlap(text1, text2, n=3):
-    """Вычисляет перекрытие n-грамм"""
-    ngrams1 = set(extract_ngrams(text1, n))
-    ngrams2 = set(extract_ngrams(text2, n))
-    
-    if not ngrams1:
-        return 0.0
-    
-    overlap = len(ngrams1.intersection(ngrams2))
-    return overlap / len(ngrams1)
-
 def find_definition_for_question(lecture, question_text):
     """Находит термин по определению из вопроса"""
     question_normalized = normalize_text(question_text)
     
+    # КРИТИЧЕСКИ ВАЖНО: убираем "электричество" из КОНЦА вопроса
+    # Паттерн: "... – это <input/> электричество."
+    question_normalized = re.sub(r'\s*это\s+\S*\s*электричество\s*\.?\s*$', '', question_normalized)
+    question_normalized = re.sub(r'\s+электричество\s*\.?\s*$', '', question_normalized)
+    
     # Убираем служебные фразы
-    for phrase in ['какое слово пропущено', 'это ответ', 'вопрос', 'электричество']:
+    for phrase in ['какое слово пропущено', 'это ответ', 'вопрос']:
         question_normalized = question_normalized.replace(phrase, '')
     
     question_normalized = question_normalized.strip()
@@ -165,86 +144,48 @@ def find_definition_for_question(lecture, question_text):
     if len(question_keywords) < 3:
         return None
     
-    # Паттерны для поиска определений
-    patterns = [
-        r'([А-ЯЁ][а-яё\s\-]{2,60})\s*[—\-:]\s*это\s+([^.!?]{20,400}[.!?])',
-        r'([А-ЯЁ][а-яё\s\-]{2,60})\s+[—\-]\s+([^.!?]{20,400}[.!?])',
-    ]
+    # Паттерн: ТЕРМИН - это ОПРЕДЕЛЕНИЕ
+    pattern = r'([А-ЯЁ][а-яёА-ЯЁ\s\-]{2,60})\s*(?:[—\-:]|[\s]+-[\s]+)\s*это\s+([^.!?]{20,400}[.!?])'
     
     best_match = None
     best_score = 0.0
     
-    for pattern in patterns:
-        for match in re.finditer(pattern, lecture, re.IGNORECASE):
-            term = match.group(1).strip()
-            definition = match.group(2).strip()
-            
-            # Убираем дублирование в термине (если есть)
-            term_words = term.split()
-            if len(term_words) >= 2:
-                # Проверяем на дублирование соседних слов
-                seen = []
-                for word in term_words:
-                    if not seen or word.lower() != seen[-1].lower():
-                        seen.append(word)
-                term = ' '.join(seen)
-            
-            similarity = calculate_text_similarity(definition, question_text)
-            ngram_score = calculate_ngram_overlap(definition, question_text, 3)
-            
-            definition_normalized = normalize_text(definition)
-            keyword_matches = sum(1 for kw in question_keywords if kw in definition_normalized)
-            keyword_ratio = keyword_matches / len(question_keywords) if question_keywords else 0
-            
-            combined_score = (similarity * 0.5) + (keyword_ratio * 0.3) + (ngram_score * 0.2)
-            
-            if combined_score > best_score and combined_score > 0.5:
-                best_score = combined_score
-                best_match = {
-                    "term": term,
-                    "definition": definition,
-                    "position": match.start(),
-                    "score": combined_score
-                }
+    for match in re.finditer(pattern, lecture, re.IGNORECASE):
+        full_term = match.group(1).strip()
+        definition = match.group(2).strip()
+        
+        # Убираем дублирование в термине (если слова повторяются подряд)
+        term_parts = full_term.split()
+        cleaned_parts = []
+        for i, part in enumerate(term_parts):
+            if i == 0 or part.lower() != term_parts[i-1].lower():
+                cleaned_parts.append(part)
+        
+        term = ' '.join(cleaned_parts)
+        
+        # Вычисляем схожесть
+        similarity = calculate_text_similarity(definition, question_text)
+        
+        # Точные совпадения ключевых слов
+        definition_normalized = normalize_text(definition)
+        keyword_matches = sum(1 for kw in question_keywords if kw in definition_normalized)
+        keyword_ratio = keyword_matches / len(question_keywords) if question_keywords else 0
+        
+        combined_score = (similarity * 0.5) + (keyword_ratio * 0.5)
+        
+        if combined_score > best_score and combined_score > 0.5:
+            best_score = combined_score
+            best_match = {
+                "term": term,
+                "definition": definition,
+                "position": match.start(),
+                "score": combined_score
+            }
     
     return best_match
 
-def extract_key_concepts_from_question(question):
-    """Извлекает ключевые концепции из вопроса"""
-    q_lower = normalize_text(question)
-    concepts = []
-    
-    # Для вопросов про единицы измерения ДОЗ
-    if 'единиц' in q_lower and 'измерения' in q_lower:
-        # Проверяем наличие "эквивалентн" И "эффективн" (оба!)
-        has_equiv = 'эквивалентн' in q_lower
-        has_eff = 'эффективн' in q_lower
-        has_dose = 'доз' in q_lower
-        
-        # ВАЖНО: добавляем концепты только если есть ВСЕ ключевые слова
-        if has_equiv and has_eff and has_dose:
-            concepts.extend(['эквивалентн', 'эффективн', 'доз'])
-            # Дополнительный маркер для строгого фильтра
-            concepts.append('_units_strict_')
-    
-    if 'излуч' in q_lower:
-        if 'электромагнитн' in q_lower:
-            concepts.append('электромагнитн')
-        if 'корпускулярн' in q_lower:
-            concepts.append('корпускулярн')
-        if 'проникающ' in q_lower:
-            concepts.append('проникающ')
-        if 'ионизирующ' in q_lower:
-            concepts.append('ионизирующ')
-        if 'малым ионизирующим' in q_lower or 'малое ионизирующее' in q_lower:
-            concepts.append('малым_ионизирующим')
-        if 'большой проникающей' in q_lower or 'большая проникающая' in q_lower:
-            concepts.append('большой_проникающей')
-    
-    return concepts
-
 def score_option_by_lecture(lecture, option, question=""):
-    """Оценивает опцию на основе лекции с учётом контекста вопроса"""
+    """Оценивает опцию на основе лекции"""
     L = normalize_text(lecture)
     opt = normalize_text(option)
     q = normalize_text(question)
@@ -252,9 +193,16 @@ def score_option_by_lecture(lecture, option, question=""):
     score = 0
     snippets = []
     
-    key_concepts = extract_key_concepts_from_question(question)
-    is_units_strict = '_units_strict_' in key_concepts
+    # СТРОГАЯ проверка для единиц измерения ДОЗ
+    is_dose_units_question = False
+    if 'единиц' in q and 'измерения' in q and 'доз' in q:
+        # Проверяем наличие "эквивалентн" ИЛИ "эффективн"
+        has_equiv = 'эквивалентн' in q
+        has_eff = 'эффективн' in q
+        if has_equiv or has_eff:
+            is_dose_units_question = True
     
+    # Точное вхождение
     exact_pattern = re.escape(opt)
     exact_matches = list(re.finditer(exact_pattern, L))
     exact_count = len(exact_matches)
@@ -262,110 +210,96 @@ def score_option_by_lecture(lecture, option, question=""):
     if exact_count > 0:
         base_score = 2.5 * (1 + exact_count)**0.4
         
-        best_context_score = 0
-        best_context_snippet = None
+        best_snippet = None
+        has_correct_dose_context = False
         
         for match in exact_matches:
             match_pos = match.start()
             
-            # Широкий контекст
+            # Берём контекст вокруг совпадения
             context_start = max(0, match_pos - 300)
             context_end = min(len(L), match_pos + 300)
             context = L[context_start:context_end]
             
-            # Подсчёт концептов в контексте
-            if is_units_strict:
-                # ДЛЯ UNITS: требуем наличие ВСЕХ трёх концептов
-                has_equiv = 'эквивалентн' in context
-                has_eff = 'эффективн' in context
-                has_dose = 'доз' in context
+            # Для вопроса про дозы проверяем СТРОГОЕ наличие нужных слов
+            if is_dose_units_question:
+                # Проверяем "эквивалентн" или "эффективн" + "измерения"
+                has_equiv_meas = ('эквивалентн' in context and 'измерения' in context) or 'эквивалентной дозы' in context
+                has_eff_meas = ('эффективн' in context and 'измерения' in context) or 'эффективной дозы' in context
                 
-                # Считаем context_score только если ВСЕ три есть
-                if has_equiv and has_eff and has_dose:
-                    context_score = 3
-                else:
-                    context_score = 0
-            else:
-                # Обычный подсчёт
-                context_score = sum(1 for concept in key_concepts 
-                                  if concept != '_units_strict_' and concept in context)
-            
-            if context_score > best_context_score:
-                best_context_score = context_score
-                orig_pos = lecture.lower().find(opt, match_pos - 10)
-                if orig_pos != -1:
-                    best_context_snippet = extract_full_sentences(lecture, orig_pos, 2)
+                # Проверяем, что это НЕ "поглощенная доза"
+                is_absorbed = 'поглощенн' in context
+                
+                if (has_equiv_meas or has_eff_meas) and not is_absorbed:
+                    has_correct_dose_context = True
+                    orig_pos = lecture.lower().find(opt, match_pos - 10)
+                    if orig_pos != -1:
+                        best_snippet = extract_full_sentences(lecture, orig_pos, 2)
+                    break
         
-        if best_context_score > 0:
-            base_score *= (1 + best_context_score * 0.8)
-            if best_context_snippet:
-                snippets.append({
-                    "why": f"exact_context (concepts: {best_context_score})",
-                    "excerpt": best_context_snippet
-                })
+        # Применяем бонус/штраф
+        if is_dose_units_question:
+            if has_correct_dose_context:
+                # МЕГА БОНУС для правильных единиц
+                base_score *= 15.0
+                if best_snippet:
+                    snippets.append({
+                        "why": "exact_dose_context",
+                        "excerpt": best_snippet
+                    })
+            else:
+                # КРИТИЧЕСКИЙ ШТРАФ для неправильных
+                base_score *= 0.005
         else:
-            # КРИТИЧЕСКИЙ ШТРАФ для units без контекста
-            if is_units_strict:
-                base_score *= 0.05  # Почти обнуляем
-            elif key_concepts:
-                base_score *= 0.2
+            # Обычная логика
+            if best_snippet is None:
+                orig_pos = lecture.lower().find(opt)
+                if orig_pos != -1:
+                    best_snippet = extract_full_sentences(lecture, orig_pos, 2)
             
-            if best_context_snippet:
+            if best_snippet:
                 snippets.append({
                     "why": "exact",
-                    "excerpt": best_context_snippet
+                    "excerpt": best_snippet
                 })
         
         score += base_score
     
-    # Поиск определений
+    # Определения
     def_patterns = [
         rf"{re.escape(opt)}\s*[—\-:]\s*это\s+([^.!?]+[.!?])",
-        rf"{re.escape(opt)}\s+[—\-]\s+([^.!?]+[.!?])",
         rf"{re.escape(opt)}\s+представляет\s+собой\s+([^.!?]+[.!?])",
     ]
     
     for pat in def_patterns:
         for match in re.finditer(pat, lecture, re.IGNORECASE):
-            match_text = match.group(0)
             definition = match.group(1) if len(match.groups()) > 0 else ""
             
             def_normalized = normalize_text(definition)
             q_words = [w for w in q.split() if len(w) > 3]
             match_count = sum(1 for w in q_words if w in def_normalized)
             
-            concept_in_def = sum(1 for concept in key_concepts 
-                                if concept != '_units_strict_' and concept in def_normalized)
-            
             bonus = 4.0
             if match_count > 0:
                 bonus *= (1 + match_count * 0.3)
-            if concept_in_def > 0:
-                bonus *= (1 + concept_in_def * 0.4)
             
             score += bonus
             full_sentence = extract_full_sentences(lecture, match.start(), 2)
             snippets.append({
-                "why": f"definition (q_words: {match_count}, concepts: {concept_in_def})",
+                "why": f"definition",
                 "excerpt": full_sentence
             })
     
-    # Пересечение слов
+    # Пересечение слов (НЕ добавляем в snippets)
     opt_words = set(opt.split())
     if opt_words and len(opt_words) > 1:
         matched_words = len(opt_words.intersection(set(L.split())))
         ratio = matched_words / len(opt_words)
         score += ratio * 1.5
-        if ratio > 0:
-            snippets.append({
-                "why": "word-match",
-                "matched": f"{matched_words}/{len(opt_words)}"
-            })
     
     return {"score": score, "snippets": snippets}
 
 def detect_question_type(qtext):
-    """Определяет тип вопроса"""
     q = normalize_text(qtext)
     
     if re.search(r'(какое слово пропущено|слово пропущено|впишите|введите)', qtext, re.IGNORECASE):
@@ -388,7 +322,6 @@ def detect_question_type(qtext):
     return 'single'
 
 def parse_html_quiz(html):
-    """Парсит HTML теста"""
     soup = BeautifulSoup(html, 'html.parser')
     questions = []
     
@@ -562,46 +495,14 @@ async def process_quiz(data: ProcessQuizRequest):
                 }]
         
         elif qtype == 'units':
-            key_concepts = extract_key_concepts_from_question(qtext)
-            is_units_strict = '_units_strict_' in key_concepts
-            
-            if is_units_strict:
-                # СТРОГАЯ ЛОГИКА: выбираем ТОЛЬКО варианты с ПОЛНЫМ контекстом
-                context_matches = []
-                for s in scored:
-                    # Проверяем, есть ли сниппет с concepts: 3 (все три концепта!)
-                    has_full_context = any(
-                        'exact_context' in snippet.get('why', '') and 'concepts: 3' in snippet.get('why', '')
-                        for snippet in s['snippets']
-                    )
-                    if has_full_context:
-                        context_matches.append(s)
-                
-                if context_matches:
-                    # Сортируем по score
-                    context_matches.sort(key=lambda x: x["score"], reverse=True)
-                    selected = [
-                        {"option": s["option"], "score": s["norm"], "snippets": s["snippets"]}
-                        for s in context_matches
-                    ]
-                else:
-                    # Если не нашли с полным контекстом - берём топ-1 как fallback
-                    sorted_scores = sorted(scored, key=lambda x: x["score"], reverse=True)
-                    if sorted_scores:
-                        selected = [{
-                            "option": sorted_scores[0]["option"],
-                            "score": sorted_scores[0]["norm"],
-                            "snippets": sorted_scores[0]["snippets"]
-                        }]
-            else:
-                # Обычная логика для units
-                sorted_scores = sorted(scored, key=lambda x: x["score"], reverse=True)
-                if sorted_scores:
-                    selected = [{
-                        "option": sorted_scores[0]["option"],
-                        "score": sorted_scores[0]["norm"],
-                        "snippets": sorted_scores[0]["snippets"]
-                    }]
+            # Просто выбираем топ-1 по score (логика уже в scoring)
+            sorted_scores = sorted(scored, key=lambda x: x["score"], reverse=True)
+            if sorted_scores:
+                selected = [{
+                    "option": sorted_scores[0]["option"],
+                    "score": sorted_scores[0]["norm"],
+                    "snippets": sorted_scores[0]["snippets"]
+                }]
         
         else:  # multi
             candidates = [s for s in scored if s["norm"] >= 0.5]
