@@ -6,7 +6,10 @@ jinja2==3.1.4
 python-multipart==0.0.17
 pydantic==2.9.2
 PyMuPDF==1.24.13
+gunicorn==23.0.0
 
-# Только лёгкие библиотеки
-scikit-learn==1.5.0  # ~30MB
+# ML библиотеки (оптимизировано для Render 512 MB)
+scikit-learn==1.5.0  # ~30MB (TF-IDF + косинусное сходство)
 numpy==1.26.4        # ~20MB
+
+# ИТОГО: ~100 MB (Python) + ~50 MB (FastAPI) + ~50 MB (ML) + ~50 MB (буферы) = ~250 MB << 512 MB
