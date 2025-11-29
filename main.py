@@ -287,7 +287,7 @@ def extract_lists_from_lecture(lecture):
                         words = item.strip().split()[:10]
                         cleaned_item = ' '.join(words)
                         # Убираем trailing запятые, точки с запятой
-                        cleaned_item = re.sub(r'[,;])
+                        cleaned_item = re.sub(r'[,;]+
     
     score = 0.0
     snippets = []
