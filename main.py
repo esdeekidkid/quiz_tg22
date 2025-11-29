@@ -195,8 +195,10 @@ def score_option_by_lecture(lecture, option, question=""):
             is_dose_units = True
             print(f"✓ Это вопрос про единицы ДОЗ")
     
-    # Поиск точных вхождений
-    exact_matches = list(re.finditer(re.escape(opt), L))
+    # Поиск точных вхождений (ТОЛЬКО ЦЕЛЫЕ СЛОВА!)
+    # Добавляем границы слов \b для поиска целых слов
+    word_pattern = r'\b' + re.escape(opt) + r'\b'
+    exact_matches = list(re.finditer(word_pattern, L))
     exact_count = len(exact_matches)
     
     print(f"Найдено вхождений: {exact_count}")
@@ -216,16 +218,26 @@ def score_option_by_lecture(lecture, option, question=""):
             
             if is_dose_units:
                 # СТРОГАЯ ПРОВЕРКА ДЛЯ ДОЗ
-                has_equiv = 'эквивалентн' in context and ('измерения' in context or 'дозы' in context)
-                has_eff = 'эффективн' in context and ('измерения' in context or 'дозы' in context)
+                # Ищем ЦЕЛОЕ СЛОВО "дозы" рядом с единицей измерения
+                has_equiv = 'эквивалентн' in context and (re.search(r'\bизмерения\b', context) or re.search(r'\bдоз[ыа]\b', context))
+                has_eff = 'эффективн' in context and (re.search(r'\bизмерения\b', context) or re.search(r'\bдоз[ыа]\b', context))
                 is_absorbed = 'поглощенн' in context
+                
+                # КРИТИЧЕСКАЯ ПРОВЕРКА: исключаем "рада" из "эквивалент рада"
+                is_rada_equivalent = False
+                if opt == 'рад':
+                    # Проверяем, не является ли это "бэр (биологический эквивалент рада)"
+                    if 'эквивалент рада' in context or 'эквивалента рада' in context:
+                        is_rada_equivalent = True
+                        print(f"    ! Найден 'эквивалент рада' (НЕ единица эквивалентной дозы!)")
                 
                 print(f"  Контекст проверка:")
                 print(f"    - эквивалентн: {has_equiv}")
                 print(f"    - эффективн: {has_eff}")
                 print(f"    - поглощенн: {is_absorbed}")
+                print(f"    - рада_эквивалент: {is_rada_equivalent}")
                 
-                if (has_equiv or has_eff) and not is_absorbed:
+                if (has_equiv or has_eff) and not is_absorbed and not is_rada_equivalent:
                     dose_context_found = True
                     orig_pos = lecture.lower().find(opt, match_pos - 10)
                     if orig_pos != -1:
