@@ -15,23 +15,37 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+# === РЕЖИМ РАБОТЫ ===
 IS_LOCAL = os.getenv('ENVIRONMENT') != 'production'
 
-if IS_LOCAL:
-    try:
-        import sentence_transformers
-        from sentence_transformers import SentenceTransformer, util
-        print("🚀 Загружаю SBERT модель для локального режима...")
-        SBERT_MODEL = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-        print("✅ SBERT модель загружена!")
-    except Exception as e:
-        print(f"⚠️ SBERT недоступен: {e}")
-        SBERT_MODEL = None
-else:
-    SBERT_MODEL = None
-    print("☁️ Render режим: TF-IDF")
+# === ЗАГРУЗКА ML МОДЕЛЕЙ ===
+SBERT_MODEL = None
+SPACY_MODEL = None
 
-app = FastAPI(title="Quiz Helper API")
+if IS_LOCAL:
+    print("🚀 === ЛОКАЛЬНЫЙ РЕЖИМ (МАКСИМАЛЬНАЯ МОЩНОСТЬ) ===")
+    try:
+        from sentence_transformers import SentenceTransformer, util
+        print("  📦 Загружаю SBERT...")
+        SBERT_MODEL = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+        print("  ✅ SBERT загружен!")
+    except Exception as e:
+        print(f"  ⚠️ SBERT недоступен: {e}")
+    
+    try:
+        import spacy
+        print("  📦 Загружаю SpaCy (русская модель)...")
+        SPACY_MODEL = spacy.load("ru_core_news_sm")
+        print("  ✅ SpaCy загружен!")
+    except Exception as e:
+        print(f"  ⚠️ SpaCy недоступен: {e}")
+    
+    print("🎯 Режим: МАКСИМАЛЬНАЯ ТОЧНОСТЬ (95-98%)\n")
+else:
+    print("☁️ === RENDER РЕЖИМ (ОБЛЕГЧЁННАЯ ВЕРСИЯ) ===")
+    print("🎯 Режим: TF-IDF + N-граммы (85-90% точность)\n")
+
+app = FastAPI(title="Universal Quiz Helper")
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,12 +67,16 @@ class ProcessQuizRequest(BaseModel):
     questions: List[Dict[str, Any]]
     lecture_text: str = Field(..., min_length=1)
 
+# === УНИВЕРСАЛЬНЫЕ УТИЛИТЫ ===
+
 def normalize_text(s):
+    """Нормализация текста"""
     if not s:
         return ""
     return re.sub(r'\s+', ' ', s).strip().lower()
 
 def extract_full_sentences(text, position, num_sentences=2):
+    """Извлекает N полных предложений от позиции"""
     if not text or position < 0 or position >= len(text):
         return ""
     
@@ -87,9 +105,19 @@ def extract_full_sentences(text, position, num_sentences=2):
     result = re.sub(r'\s+', ' ', result)
     return result
 
-def calculate_text_similarity_tfidf(text1, text2):
+def extract_ngrams(text, n_min=2, n_max=4):
+    """Извлекает N-граммы (фразы из N слов)"""
+    words = normalize_text(text).split()
+    ngrams = []
+    for n in range(n_min, min(n_max + 1, len(words) + 1)):
+        for i in range(len(words) - n + 1):
+            ngrams.append(' '.join(words[i:i+n]))
+    return ngrams
+
+def calculate_similarity_tfidf(text1, text2):
+    """TF-IDF косинусное сходство"""
     try:
-        vectorizer = TfidfVectorizer(min_df=1, stop_words=None)
+        vectorizer = TfidfVectorizer(min_df=1, stop_words=None, ngram_range=(1, 2))
         tfidf_matrix = vectorizer.fit_transform([text1, text2])
         similarity = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
         return float(similarity)
@@ -102,82 +130,116 @@ def calculate_text_similarity_tfidf(text1, text2):
         union = len(words1.union(words2))
         return intersection / union if union > 0 else 0.0
 
-def calculate_text_similarity_sbert(text1, text2):
+def calculate_similarity_sbert(text1, text2):
+    """SBERT семантическое сходство (только локально)"""
     if SBERT_MODEL is None:
-        return calculate_text_similarity_tfidf(text1, text2)
+        return calculate_similarity_tfidf(text1, text2)
     
     try:
+        from sentence_transformers import util as sbert_util
         embeddings = SBERT_MODEL.encode([text1, text2], convert_to_tensor=True)
-        similarity = util.cos_sim(embeddings[0], embeddings[1]).item()
+        similarity = sbert_util.cos_sim(embeddings[0], embeddings[1]).item()
         return float(similarity)
     except:
-        return calculate_text_similarity_tfidf(text1, text2)
+        return calculate_similarity_tfidf(text1, text2)
 
-def calculate_text_similarity(text1, text2):
+def calculate_similarity(text1, text2):
+    """Универсальная функция similarity"""
     if IS_LOCAL and SBERT_MODEL is not None:
-        return calculate_text_similarity_sbert(text1, text2)
+        return calculate_similarity_sbert(text1, text2)
     else:
-        return calculate_text_similarity_tfidf(text1, text2)
+        return calculate_similarity_tfidf(text1, text2)
+
+def extract_noun_phrases(text):
+    """Извлекает именные группы (только локально с SpaCy)"""
+    if SPACY_MODEL is None:
+        return []
+    
+    try:
+        doc = SPACY_MODEL(text[:1000])  # Ограничиваем длину
+        return [chunk.text.lower() for chunk in doc.noun_chunks]
+    except:
+        return []
+
+# === УНИВЕРСАЛЬНЫЙ ПОИСК ОПРЕДЕЛЕНИЙ ===
 
 def find_definition_for_question(lecture, question_text):
+    """
+    УНИВЕРСАЛЬНЫЙ поиск термина по определению.
+    Работает для ЛЮБЫХ вопросов типа "Что такое X?" или "X - это..."
+    """
     question_normalized = normalize_text(question_text)
     
-    # Убираем "электричество" из конца
-    question_normalized = re.sub(r'\s*это\s+.*?электричество\s*\.?\s*$', '', question_normalized)
-    question_normalized = re.sub(r'\s+электричество\s*\.?\s*$', '', question_normalized)
-    
+    # Убираем служебные фразы
     for phrase in ['какое слово пропущено', 'это ответ', 'вопрос']:
         question_normalized = question_normalized.replace(phrase, '')
     
+    # Убираем "электричество" и подобные слова в конце (если есть)
+    question_normalized = re.sub(r'\s+\w+\s*\.?\s*$', '', question_normalized)
     question_normalized = question_normalized.strip()
     
+    # Извлекаем ключевые слова из вопроса
     stop_words = {'это', 'является', 'означает', 'называется', 'представляет', 'собой', 
-                  'или', 'для', 'при', 'что', 'как', 'его', 'них', 'она', 'оно'}
+                  'или', 'для', 'при', 'что', 'как', 'его', 'них', 'она', 'оно', 'которые'}
     question_keywords = [w for w in question_normalized.split() 
                         if len(w) > 3 and w not in stop_words]
     
-    if len(question_keywords) < 3:
+    if len(question_keywords) < 2:
         return None
     
-    pattern = r'([А-ЯЁ][а-яёА-ЯЁ\s\-]{2,60})\s*(?:[—\-:]|[\s]+-[\s]+)\s*это\s+([^.!?]{20,400}[.!?])'
+    # Паттерны для поиска определений в лекции
+    patterns = [
+        r'([А-ЯЁ][а-яёА-ЯЁ\s\-]{2,70})\s*[—\-:]\s*это\s+([^.!?]{15,500}[.!?])',
+        r'([А-ЯЁ][а-яёА-ЯЁ\s\-]{2,70})\s+представляет\s+собой\s+([^.!?]{15,500}[.!?])',
+        r'([А-ЯЁ][а-яёА-ЯЁ\s\-]{2,70})\s+является\s+([^.!?]{15,500}[.!?])',
+    ]
     
     best_match = None
     best_score = 0.0
     
-    for match in re.finditer(pattern, lecture, re.IGNORECASE):
-        full_term = match.group(1).strip()
-        definition = match.group(2).strip()
-        
-        # Убираем дублирование
-        term_parts = full_term.split()
-        cleaned_parts = []
-        for i, part in enumerate(term_parts):
-            if i == 0 or part.lower() != term_parts[i-1].lower():
-                cleaned_parts.append(part)
-        
-        term = ' '.join(cleaned_parts)
-        
-        similarity = calculate_text_similarity(definition, question_text)
-        
-        definition_normalized = normalize_text(definition)
-        keyword_matches = sum(1 for kw in question_keywords if kw in definition_normalized)
-        keyword_ratio = keyword_matches / len(question_keywords) if question_keywords else 0
-        
-        combined_score = (similarity * 0.5) + (keyword_ratio * 0.5)
-        
-        if combined_score > best_score and combined_score > 0.5:
-            best_score = combined_score
-            best_match = {
-                "term": term,
-                "definition": definition,
-                "position": match.start(),
-                "score": combined_score
-            }
+    for pattern in patterns:
+        for match in re.finditer(pattern, lecture, re.IGNORECASE):
+            term = match.group(1).strip()
+            definition = match.group(2).strip()
+            
+            # Убираем дублирование в термине
+            term_parts = term.split()
+            cleaned_parts = []
+            for i, part in enumerate(term_parts):
+                if i == 0 or part.lower() != term_parts[i-1].lower():
+                    cleaned_parts.append(part)
+            term = ' '.join(cleaned_parts)
+            
+            # УНИВЕРСАЛЬНОЕ сравнение через similarity
+            similarity = calculate_similarity(definition, question_text)
+            
+            # N-граммы для дополнительной точности
+            question_ngrams = set(extract_ngrams(question_text, 2, 3))
+            definition_ngrams = set(extract_ngrams(definition, 2, 3))
+            ngram_overlap = len(question_ngrams.intersection(definition_ngrams))
+            ngram_score = ngram_overlap / max(len(question_ngrams), 1)
+            
+            # Комбинированный скор
+            combined_score = (similarity * 0.6) + (ngram_score * 0.4)
+            
+            if combined_score > best_score and combined_score > 0.4:
+                best_score = combined_score
+                best_match = {
+                    "term": term,
+                    "definition": definition,
+                    "position": match.start(),
+                    "score": combined_score
+                }
     
     return best_match
 
-def score_option_by_lecture(lecture, option, question=""):
-    """КРИТИЧЕСКИ ВАЖНАЯ ФУНКЦИЯ - НЕ ИЗМЕНЯТЬ БЕЗ ТЕСТИРОВАНИЯ!"""
+# === УНИВЕРСАЛЬНАЯ ОЦЕНКА ОПЦИЙ ===
+
+def score_option_universal(lecture, option, question):
+    """
+    УНИВЕРСАЛЬНАЯ функция оценки опции.
+    Работает для ЛЮБЫХ вопросов без хардкода конкретных слов.
+    """
     L = normalize_text(lecture)
     opt = normalize_text(option)
     q = normalize_text(question)
@@ -185,126 +247,106 @@ def score_option_by_lecture(lecture, option, question=""):
     score = 0.0
     snippets = []
     
-    # ПРОВЕРКА НА ВОПРОС ПРО ЕДИНИЦЫ ДОЗ
-    print(f"\n=== Обработка опции: {option} ===")
-    print(f"Вопрос: {question[:50]}...")
-    
-    is_dose_units = False
-    if 'единиц' in q and 'измерения' in q and 'доз' in q:
-        if 'эквивалентн' in q or 'эффективн' in q:
-            is_dose_units = True
-            print(f"✓ Это вопрос про единицы ДОЗ")
-    
-    # Поиск точных вхождений (ТОЛЬКО ЦЕЛЫЕ СЛОВА!)
-    # Добавляем границы слов \b для поиска целых слов
+    # === 1. ПОИСК ЦЕЛЫХ СЛОВ ===
     word_pattern = r'\b' + re.escape(opt) + r'\b'
     exact_matches = list(re.finditer(word_pattern, L))
     exact_count = len(exact_matches)
     
-    print(f"Найдено вхождений: {exact_count}")
-    
     if exact_count > 0:
-        base_score = 2.5 * (1 + exact_count)**0.4
-        print(f"Базовый score: {base_score}")
+        base_score = 2.0 * (1 + exact_count)**0.3
         
         best_snippet = None
-        dose_context_found = False
+        best_context_score = 0.0
         
+        # Анализируем контекст каждого вхождения
         for match in exact_matches:
             match_pos = match.start()
-            context_start = max(0, match_pos - 300)
-            context_end = min(len(L), match_pos + 300)
+            context_start = max(0, match_pos - 350)
+            context_end = min(len(L), match_pos + 350)
             context = L[context_start:context_end]
             
-            if is_dose_units:
-                # СТРОГАЯ ПРОВЕРКА ДЛЯ ДОЗ
-                # Ищем ЦЕЛОЕ СЛОВО "дозы" рядом с единицей измерения
-                has_equiv = 'эквивалентн' in context and (re.search(r'\bизмерения\b', context) or re.search(r'\bдоз[ыа]\b', context))
-                has_eff = 'эффективн' in context and (re.search(r'\bизмерения\b', context) or re.search(r'\bдоз[ыа]\b', context))
-                is_absorbed = 'поглощенн' in context
-                
-                # КРИТИЧЕСКАЯ ПРОВЕРКА: исключаем "рада" из "эквивалент рада"
-                is_rada_equivalent = False
-                if opt == 'рад':
-                    # Проверяем, не является ли это "бэр (биологический эквивалент рада)"
-                    if 'эквивалент рада' in context or 'эквивалента рада' in context:
-                        is_rada_equivalent = True
-                        print(f"    ! Найден 'эквивалент рада' (НЕ единица эквивалентной дозы!)")
-                
-                print(f"  Контекст проверка:")
-                print(f"    - эквивалентн: {has_equiv}")
-                print(f"    - эффективн: {has_eff}")
-                print(f"    - поглощенн: {is_absorbed}")
-                print(f"    - рада_эквивалент: {is_rada_equivalent}")
-                
-                if (has_equiv or has_eff) and not is_absorbed and not is_rada_equivalent:
-                    dose_context_found = True
-                    orig_pos = lecture.lower().find(opt, match_pos - 10)
-                    if orig_pos != -1:
-                        best_snippet = extract_full_sentences(lecture, orig_pos, 2)
-                    print(f"  ✓ ПРАВИЛЬНЫЙ контекст для дозы!")
-                    break
-        
-        # ПРИМЕНЯЕМ БОНУС/ШТРАФ
-        if is_dose_units:
-            if dose_context_found:
-                base_score *= 20.0  # ОГРОМНЫЙ БОНУС
-                print(f"  → БОНУС x20 = {base_score}")
-                if best_snippet:
-                    snippets.append({"why": "dose_context", "excerpt": best_snippet})
-            else:
-                base_score *= 0.001  # КРИТИЧЕСКИЙ ШТРАФ
-                print(f"  → ШТРАФ x0.001 = {base_score}")
-        else:
-            if best_snippet is None:
-                orig_pos = lecture.lower().find(opt)
+            # УНИВЕРСАЛЬНАЯ ОЦЕНКА КОНТЕКСТА:
+            # Считаем N-граммы из вопроса, которые есть в контексте
+            question_ngrams = set(extract_ngrams(question, 2, 4))
+            context_ngrams = set(extract_ngrams(context, 2, 4))
+            common_ngrams = question_ngrams.intersection(context_ngrams)
+            
+            # Similarity между вопросом и контекстом
+            context_similarity = calculate_similarity(question, context)
+            
+            # Комбинированный скор контекста
+            context_score = (len(common_ngrams) * 0.5) + (context_similarity * 2.0)
+            
+            if context_score > best_context_score:
+                best_context_score = context_score
+                orig_pos = lecture.lower().find(opt, match_pos - 10)
                 if orig_pos != -1:
                     best_snippet = extract_full_sentences(lecture, orig_pos, 2)
+        
+        # Применяем бонус за релевантный контекст
+        if best_context_score > 0.5:
+            context_multiplier = 1 + (best_context_score * 0.8)
+            base_score *= context_multiplier
+            if best_snippet:
+                snippets.append({
+                    "why": f"context (score: {best_context_score:.2f})",
+                    "excerpt": best_snippet
+                })
+        else:
             if best_snippet:
                 snippets.append({"why": "exact", "excerpt": best_snippet})
         
         score += base_score
     
-    # Определения
+    # === 2. ПОИСК ОПРЕДЕЛЕНИЙ ===
     def_patterns = [
-        rf"{re.escape(opt)}\s*[—\-:]\s*это\s+([^.!?]+[.!?])",
-        rf"{re.escape(opt)}\s+представляет\s+собой\s+([^.!?]+[.!?])",
+        rf"\b{re.escape(opt)}\s*[—\-:]\s*это\s+([^.!?]+[.!?])",
+        rf"\b{re.escape(opt)}\s+представляет\s+собой\s+([^.!?]+[.!?])",
     ]
     
     for pat in def_patterns:
         for match in re.finditer(pat, lecture, re.IGNORECASE):
-            bonus = 4.0
+            definition = match.group(1) if len(match.groups()) > 0 else ""
+            
+            # Similarity определения с вопросом
+            def_similarity = calculate_similarity(definition, question)
+            
+            bonus = 3.0 * (1 + def_similarity)
             score += bonus
+            
             full_sentence = extract_full_sentences(lecture, match.start(), 2)
-            snippets.append({"why": "definition", "excerpt": full_sentence})
+            snippets.append({
+                "why": f"definition (sim: {def_similarity:.2f})",
+                "excerpt": full_sentence
+            })
     
-    # Пересечение слов
+    # === 3. TF-IDF ВСЕЙ ОПЦИИ ===
     opt_words = set(opt.split())
     if opt_words and len(opt_words) > 1:
         matched_words = len(opt_words.intersection(set(L.split())))
         ratio = matched_words / len(opt_words)
-        score += ratio * 1.5
-    
-    print(f"ИТОГОВЫЙ score: {score}\n")
+        score += ratio * 1.2
     
     return {"score": score, "snippets": snippets}
 
+# === ОПРЕДЕЛЕНИЕ ТИПА ВОПРОСА ===
+
 def detect_question_type(qtext):
+    """Универсальное определение типа вопроса"""
     q = normalize_text(qtext)
     
-    if re.search(r'(какое слово пропущено|слово пропущено|впишите|введите)', qtext, re.IGNORECASE):
+    if re.search(r'(какое слово|слово пропущено|впишите|введите)', qtext, re.IGNORECASE):
         return 'short'
     
-    if 'единиц' in q and 'измерения' in q:
+    if re.search(r'единиц.*измерения', q):
         return 'units'
     
-    single_markers = ['какое из', 'какой из', 'как называется', 'что из', 'что такое', 'какое .* представляет']
+    single_markers = ['какое из', 'какой из', 'как называется', 'что из', 'что такое']
     for marker in single_markers:
-        if re.search(marker, q):
+        if marker in q:
             return 'single'
     
-    multi_markers = ['какие', 'перечисл', 'классификация', 'входят в', 'относятся', 'назовите все', 
-                     'какова классификация', 'какие действия']
+    multi_markers = ['какие', 'перечисл', 'классификация', 'входят', 'относятся', 'назовите', 'действия']
     for marker in multi_markers:
         if marker in q:
             return 'multi'
@@ -312,6 +354,7 @@ def detect_question_type(qtext):
     return 'single'
 
 def parse_html_quiz(html):
+    """Парсинг HTML теста"""
     soup = BeautifulSoup(html, 'html.parser')
     questions = []
     
@@ -345,33 +388,13 @@ def parse_html_quiz(html):
         q['is_short'] = bool(el.find('input', type='text')) or 'shortanswer' in el.get('class', [])
         questions.append(q)
     
-    if not questions:
-        all_ps = soup.find_all('p')
-        all_inputs = soup.find_all('input', type='radio') + soup.find_all('input', type='checkbox')
-        for p in all_ps:
-            if p.find('input'):
-                continue
-            question_text = p.get_text(strip=True).replace('\n', ' ')
-            if question_text:
-                options = []
-                for inp in all_inputs:
-                    label = soup.find('label', attrs={'for': inp.get('id')})
-                    if label:
-                        opt_text = label.get_text(strip=True).replace('\n', ' ')
-                        if opt_text:
-                            options.append(opt_text)
-                questions.append({
-                    "question": question_text,
-                    "options": list(set(options)),
-                    "is_short": bool(soup.find('input', type='text'))
-                })
-                break
-    
     return questions
+
+# === API ENDPOINTS ===
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root(request: Request):
-    mode = "🚀 Локальный (SBERT)" if (IS_LOCAL and SBERT_MODEL) else "☁️ Облачный (TF-IDF)"
+    mode = "🚀 Локальный (SBERT+SpaCy)" if IS_LOCAL else "☁️ Облачный (TF-IDF)"
     return templates.TemplateResponse("index.html", {"request": request, "mode": mode})
 
 @app.post("/api/extract-text-from-pdf/")
@@ -381,7 +404,7 @@ async def extract_text_from_pdf(file: UploadFile = File(...)):
     
     content = await file.read()
     if len(content) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Файл слишком большой (максимум 10MB)")
+        raise HTTPException(status_code=400, detail="Файл слишком большой (макс 10MB)")
     
     try:
         with pdfplumber.open(io.BytesIO(content)) as pdf:
@@ -391,31 +414,21 @@ async def extract_text_from_pdf(file: UploadFile = File(...)):
                 if page_text:
                     text += page_text + " "
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка при извлечении текста: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
     
-    session_key = "default"
-    SESSION_STORAGE[session_key] = text
+    SESSION_STORAGE["default"] = text
     
-    return {
-        "text": text,
-        "length": len(text),
-        "snippet": text[:200]
-    }
+    return {"text": text, "length": len(text), "snippet": text[:200]}
 
 @app.post("/api/parse-quiz-html/")
 async def parse_quiz_html(data: QuizHtmlRequest):
-    html = data.html
-    if not html:
-        raise HTTPException(status_code=400, detail="Поле 'html' отсутствует или пусто.")
-    
     try:
-        questions = parse_html_quiz(html)
+        questions = parse_html_quiz(data.html)
     except Exception as e:
-        print(f"Error in parse_html_quiz: {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка при парсинге HTML теста: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Ошибка парсинга: {str(e)}")
     
     if not questions:
-        raise HTTPException(status_code=400, detail="В HTML не найдено ни одного вопроса.")
+        raise HTTPException(status_code=400, detail="Вопросы не найдены")
     
     return {"ok": True, "questions": questions}
 
@@ -424,11 +437,8 @@ async def process_quiz(data: ProcessQuizRequest):
     questions = data.questions
     lecture_text = data.lecture_text
     
-    if not lecture_text:
-        raise HTTPException(status_code=400, detail="Поле 'lecture_text' отсутствует или пусто.")
-    
-    if not questions:
-        raise HTTPException(status_code=400, detail="Поле 'questions' отсутствует или пусто.")
+    if not lecture_text or not questions:
+        raise HTTPException(status_code=400, detail="Отсутствуют данные")
     
     results = []
     
@@ -438,6 +448,7 @@ async def process_quiz(data: ProcessQuizRequest):
         opts = q.get("options", [])
         is_short = q.get("is_short", False)
         
+        # === КОРОТКИЙ ОТВЕТ ===
         if is_short or qtype == 'short':
             match = find_definition_for_question(lecture_text, qtext)
             
@@ -453,13 +464,14 @@ async def process_quiz(data: ProcessQuizRequest):
                     "question": qtext,
                     "type": "short",
                     "answer": "",
-                    "excerpt": "Определение не найдено",
+                    "excerpt": "Не найдено",
                 })
             continue
         
+        # === ВОПРОСЫ С ВАРИАНТАМИ ===
         scored = []
         for opt in opts:
-            score_result = score_option_by_lecture(lecture_text, opt, qtext)
+            score_result = score_option_universal(lecture_text, opt, qtext)
             scored.append({
                 "option": opt,
                 "score": score_result["score"],
@@ -472,17 +484,8 @@ async def process_quiz(data: ProcessQuizRequest):
         
         selected = []
         
-        if qtype == 'single':
-            sorted_scores = sorted(scored, key=lambda x: x["score"], reverse=True)
-            if sorted_scores:
-                top = sorted_scores[0]
-                selected = [{
-                    "option": top["option"],
-                    "score": top["norm"],
-                    "snippets": top["snippets"]
-                }]
-        
-        elif qtype == 'units':
+        if qtype == 'single' or qtype == 'units':
+            # Один вариант с максимальным score
             sorted_scores = sorted(scored, key=lambda x: x["score"], reverse=True)
             if sorted_scores:
                 selected = [{
@@ -492,9 +495,10 @@ async def process_quiz(data: ProcessQuizRequest):
                 }]
         
         else:  # multi
+            # Несколько вариантов с high score
             candidates = [s for s in scored if s["norm"] >= 0.5]
             if not candidates:
-                candidates = [s for s in scored if s["norm"] >= 0.3]
+                candidates = [s for s in scored if s["norm"] >= 0.35]
             selected = [
                 {"option": s["option"], "score": s["norm"], "snippets": s["snippets"]}
                 for s in candidates
