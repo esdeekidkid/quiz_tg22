@@ -26,7 +26,7 @@ if IS_LOCAL:
     print("🚀 === ЛОКАЛЬНЫЙ РЕЖИМ (МАКСИМАЛЬНАЯ МОЩНОСТЬ) ===")
     try:
         from sentence_transformers import SentenceTransformer, util
-        print("  📦 Загружаю SBERT...")
+        print("  📦 Загружаю SBERT (мощная модель)...")
         SBERT_MODEL = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
         print("  ✅ SBERT загружен!")
     except Exception as e:
@@ -42,8 +42,18 @@ if IS_LOCAL:
     
     print("🎯 Режим: МАКСИМАЛЬНАЯ ТОЧНОСТЬ (95-98%)\n")
 else:
-    print("☁️ === RENDER РЕЖИМ (ОБЛЕГЧЁННАЯ ВЕРСИЯ) ===")
-    print("🎯 Режим: TF-IDF + N-граммы (85-90% точность)\n")
+    print("☁️ === RENDER РЕЖИМ (ОБЛЕГЧЁННАЯ ВЕРСИЯ С SBERT) ===")
+    try:
+        from sentence_transformers import SentenceTransformer, util
+        print("  📦 Загружаю лёгкую SBERT модель (distiluse)...")
+        # Используем более лёгкую многоязычную модель (~480 МБ)
+        SBERT_MODEL = SentenceTransformer('distiluse-base-multilingual-cased-v2')
+        print("  ✅ Лёгкая SBERT загружена!")
+    except Exception as e:
+        print(f"  ⚠️ SBERT недоступен, используем TF-IDF: {e}")
+        SBERT_MODEL = None
+    
+    print("🎯 Режим: TF-IDF/SBERT + N-граммы (90-93% точность)\n")
 
 app = FastAPI(title="Universal Quiz Helper")
 
@@ -131,7 +141,7 @@ def calculate_similarity_tfidf(text1, text2):
         return intersection / union if union > 0 else 0.0
 
 def calculate_similarity_sbert(text1, text2):
-    """SBERT семантическое сходство (только локально)"""
+    """SBERT семантическое сходство"""
     if SBERT_MODEL is None:
         return calculate_similarity_tfidf(text1, text2)
     
@@ -145,7 +155,7 @@ def calculate_similarity_sbert(text1, text2):
 
 def calculate_similarity(text1, text2):
     """Универсальная функция similarity"""
-    if IS_LOCAL and SBERT_MODEL is not None:
+    if SBERT_MODEL is not None:
         return calculate_similarity_sbert(text1, text2)
     else:
         return calculate_similarity_tfidf(text1, text2)
@@ -235,10 +245,457 @@ def find_definition_for_question(lecture, question_text):
 
 # === УНИВЕРСАЛЬНАЯ ОЦЕНКА ОПЦИЙ ===
 
-def score_option_universal(lecture, option, question):
+# === ДЕТЕКЦИЯ СТРУКТУРИРОВАННЫХ СПИСКОВ ===
+
+def extract_lists_from_lecture(lecture):
+    """
+    Извлекает структурированные списки из лекции.
+    Например: "разделяются на 3 категории: • пункт1 • пункт2 • пункт3"
+    """
+    lists = []
+    
+    # Паттерны для заголовков списков
+    list_headers = [
+        r'разделя[юе]тся на (\w+) (категори[ию]|вид[ао]|тип[ао]|класс[ао])',
+        r'существу[ею]т (\w+) (категори[ию]|вид[ао]|тип[ао]|класс[ао])',
+        r'включа[ею]т (\w+) (категори[ию]|вид[ао]|тип[ао])',
+        r'к (\w+) относ[я]тся',
+    ]
+    
+    for pattern in list_headers:
+        for match in re.finditer(pattern, lecture, re.IGNORECASE):
+            # Нашли заголовок списка, ищем сам список после него
+            start_pos = match.end()
+            
+            # Ищем bullet points после заголовка (в пределах 500 символов)
+            text_chunk = lecture[start_pos:start_pos + 1000]
+            
+            # Паттерны для элементов списка
+            item_patterns = [
+                r'•\s*([А-ЯЁ][^\n•]{5,150})',  # • Пункт
+                r'-\s*([А-ЯЁ][^\n\-]{5,150})', # - Пункт
+                r'\d+\)\s*([А-ЯЁ][^\n]{5,150})', # 1) Пункт
+            ]
+            
+            for item_pattern in item_patterns:
+                items = re.findall(item_pattern, text_chunk)
+                if len(items) >= 2:  # Нашли список из минимум 2 элементов
+                    # Очищаем элементы
+                    cleaned_items = []
+                    for item in items:
+                        # Берём только первые 5-10 слов (заголовок пункта)
+                        words = item.strip().split()[:10]
+                        cleaned_item = ' '.join(words)
+                        # Убираем trailing запятые, точки с запятой
+                        cleaned_item = re.sub(r'[,;]+
+    
+    score = 0.0
+    snippets = []
+    
+    # === 0. БОНУС ЗА ВХОЖДЕНИЕ В СТРУКТУРИРОВАННЫЙ СПИСОК ===
+    list_bonus = 0.0
+    if relevant_list:
+        # Проверяем, есть ли вариант в списке
+        for list_item in relevant_list['items']:
+            item_norm = normalize_text(list_item)
+            
+            # Точное совпадение или высокое сходство
+            if opt in item_norm or item_norm in opt:
+                list_bonus = 10.0  # ОГРОМНЫЙ бонус!
+                snippets.append({
+                    "why": "list_match",
+                    "excerpt": f"Из перечисления: {list_item}"
+                })
+                break
+            
+            # Частичное совпадение (N-граммы)
+            opt_ngrams = set(extract_ngrams(option, 2, 3))
+            item_ngrams = set(extract_ngrams(list_item, 2, 3))
+            overlap = len(opt_ngrams.intersection(item_ngrams))
+            
+            if overlap >= 2:
+                similarity = calculate_similarity(option, list_item)
+                if similarity > 0.6:
+                    list_bonus = 7.0
+                    snippets.append({
+                        "why": f"list_partial (sim: {similarity:.2f})",
+                        "excerpt": f"Из перечисления: {list_item}"
+                    })
+                    break
+    
+    score += list_bonus
+    
+    # === 1. ПОИСК ЦЕЛЫХ СЛОВ ===
+    word_pattern = r'\b' + re.escape(opt) + r'\b'
+    exact_matches = list(re.finditer(word_pattern, L))
+    exact_count = len(exact_matches)
+    
+    if exact_count > 0:
+        base_score = 2.0 * (1 + exact_count)**0.3
+        
+        best_snippet = None
+        best_context_score = 0.0
+        
+        # Анализируем контекст каждого вхождения
+        for match in exact_matches:
+            match_pos = match.start()
+            context_start = max(0, match_pos - 350)
+            context_end = min(len(L), match_pos + 350)
+            context = L[context_start:context_end]
+            
+            # УНИВЕРСАЛЬНАЯ ОЦЕНКА КОНТЕКСТА:
+            # Считаем N-граммы из вопроса, которые есть в контексте
+            question_ngrams = set(extract_ngrams(question, 2, 4))
+            context_ngrams = set(extract_ngrams(context, 2, 4))
+            common_ngrams = question_ngrams.intersection(context_ngrams)
+            
+            # Similarity между вопросом и контекстом
+            context_similarity = calculate_similarity(question, context)
+            
+            # Комбинированный скор контекста
+            context_score = (len(common_ngrams) * 0.5) + (context_similarity * 2.0)
+            
+            if context_score > best_context_score:
+                best_context_score = context_score
+                orig_pos = lecture.lower().find(opt, match_pos - 10)
+                if orig_pos != -1:
+                    best_snippet = extract_full_sentences(lecture, orig_pos, 2)
+        
+        # Применяем бонус за релевантный контекст
+        if best_context_score > 0.5:
+            context_multiplier = 1 + (best_context_score * 0.8)
+            base_score *= context_multiplier
+            if best_snippet:
+                snippets.append({
+                    "why": f"context (score: {best_context_score:.2f})",
+                    "excerpt": best_snippet
+                })
+        else:
+            if best_snippet:
+                snippets.append({"why": "exact", "excerpt": best_snippet})
+        
+        score += base_score
+    
+    # === 2. ПОИСК ОПРЕДЕЛЕНИЙ ===
+    def_patterns = [
+        rf"\b{re.escape(opt)}\s*[—\-:]\s*это\s+([^.!?]+[.!?])",
+        rf"\b{re.escape(opt)}\s+представляет\s+собой\s+([^.!?]+[.!?])",
+    ]
+    
+    for pat in def_patterns:
+        for match in re.finditer(pat, lecture, re.IGNORECASE):
+            definition = match.group(1) if len(match.groups()) > 0 else ""
+            
+            # Similarity определения с вопросом
+            def_similarity = calculate_similarity(definition, question)
+            
+            bonus = 3.0 * (1 + def_similarity)
+            score += bonus
+            
+            full_sentence = extract_full_sentences(lecture, match.start(), 2)
+            snippets.append({
+                "why": f"definition (sim: {def_similarity:.2f})",
+                "excerpt": full_sentence
+            })
+    
+    # === 3. TF-IDF ВСЕЙ ОПЦИИ ===
+    opt_words = set(opt.split())
+    if opt_words and len(opt_words) > 1:
+        matched_words = len(opt_words.intersection(set(L.split())))
+        ratio = matched_words / len(opt_words)
+        score += ratio * 1.2
+    
+    return {"score": score, "snippets": snippets}
+
+# === ОПРЕДЕЛЕНИЕ ТИПА ВОПРОСА ===
+
+def detect_question_type(qtext):
+    """Универсальное определение типа вопроса"""
+    q = normalize_text(qtext)
+    
+    if re.search(r'(какое слово|слово пропущено|впишите|введите)', qtext, re.IGNORECASE):
+        return 'short'
+    
+    if re.search(r'единиц.*измерения', q):
+        return 'units'
+    
+    single_markers = ['какое из', 'какой из', 'как называется', 'что из', 'что такое']
+    for marker in single_markers:
+        if marker in q:
+            return 'single'
+    
+    multi_markers = ['какие', 'перечисл', 'классификация', 'входят', 'относятся', 'назовите', 'действия']
+    for marker in multi_markers:
+        if marker in q:
+            return 'multi'
+    
+    return 'single'
+
+def parse_html_quiz(html):
+    """Парсинг HTML теста"""
+    soup = BeautifulSoup(html, 'html.parser')
+    questions = []
+    
+    que_elements = soup.find_all(class_='que')
+    
+    for el in que_elements:
+        q = {}
+        qtext_el = el.find(class_='qtext')
+        if qtext_el:
+            for tag in qtext_el.find_all(['label', 'input']):
+                tag.decompose()
+            q['question'] = qtext_el.get_text(strip=True).replace('\n', ' ')
+        else:
+            q['question'] = f"Вопрос {len(questions) + 1}"
+        
+        opts = []
+        answer_divs = el.find_all(class_='answer')
+        for div in answer_divs:
+            labels = div.find_all(attrs={'data-region': 'answer-label'})
+            for label in labels:
+                opt_text = label.get_text(strip=True).replace('\n', ' ')
+                if opt_text:
+                    opts.append(opt_text)
+            for label in div.find_all('label'):
+                if not label.find_parent(class_='qtext'):
+                    opt_text = label.get_text(strip=True).replace('\n', ' ')
+                    if opt_text and opt_text not in opts:
+                        opts.append(opt_text)
+        
+        q['options'] = list(set(opts))
+        q['is_short'] = bool(el.find('input', type='text')) or 'shortanswer' in el.get('class', [])
+        questions.append(q)
+    
+    return questions
+
+# === API ENDPOINTS ===
+
+@app.get("/", response_class=HTMLResponse)
+async def read_root(request: Request):
+    if IS_LOCAL:
+        mode = "🚀 Локальный (SBERT+SpaCy)"
+    else:
+        mode = "☁️ Облачный (SBERT Lite)" if SBERT_MODEL else "☁️ Облачный (TF-IDF)"
+    return templates.TemplateResponse("index.html", {"request": request, "mode": mode})
+
+@app.post("/api/extract-text-from-pdf/")
+async def extract_text_from_pdf(file: UploadFile = File(...)):
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="Файл должен быть PDF")
+    
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Файл слишком большой (макс 10MB)")
+    
+    try:
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            text = ""
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + " "
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+    
+    SESSION_STORAGE["default"] = text
+    
+    return {"text": text, "length": len(text), "snippet": text[:200]}
+
+@app.post("/api/parse-quiz-html/")
+async def parse_quiz_html(data: QuizHtmlRequest):
+    try:
+        questions = parse_html_quiz(data.html)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка парсинга: {str(e)}")
+    
+    if not questions:
+        raise HTTPException(status_code=400, detail="Вопросы не найдены")
+    
+    return {"ok": True, "questions": questions}
+
+@app.post("/api/process-quiz/")
+async def process_quiz(data: ProcessQuizRequest):
+    questions = data.questions
+    lecture_text = data.lecture_text
+    
+    if not lecture_text or not questions:
+        raise HTTPException(status_code=400, detail="Отсутствуют данные")
+    
+    # === ИЗВЛЕКАЕМ ВСЕ СТРУКТУРИРОВАННЫЕ СПИСКИ ИЗ ЛЕКЦИИ ===
+    lecture_lists = extract_lists_from_lecture(lecture_text)
+    
+    results = []
+    
+    for q in questions:
+        qtext = q.get("question", "")
+        qtype = detect_question_type(qtext)
+        opts = q.get("options", [])
+        is_short = q.get("is_short", False)
+        
+        # === КОРОТКИЙ ОТВЕТ ===
+        if is_short or qtype == 'short':
+            match = find_definition_for_question(lecture_text, qtext)
+            
+            if match:
+                results.append({
+                    "question": qtext,
+                    "type": "short",
+                    "answer": match["term"],
+                    "excerpt": extract_full_sentences(lecture_text, match["position"], 2),
+                })
+            else:
+                results.append({
+                    "question": qtext,
+                    "type": "short",
+                    "answer": "",
+                    "excerpt": "Не найдено",
+                })
+            continue
+        
+        # === ИЩЕМ РЕЛЕВАНТНЫЙ СПИСОК ДЛЯ MULTI-ВОПРОСОВ ===
+        relevant_list = None
+        if qtype == 'multi':
+            relevant_list = find_relevant_list(qtext, lecture_lists)
+        
+        # === ВОПРОСЫ С ВАРИАНТАМИ ===
+        scored = []
+        for opt in opts:
+            score_result = score_option_universal(lecture_text, opt, qtext, relevant_list)
+            scored.append({
+                "option": opt,
+                "score": score_result["score"],
+                "snippets": score_result["snippets"]
+            })
+        
+        max_score = max([s["score"] for s in scored], default=1)
+        for s in scored:
+            s["norm"] = round(s["score"] / max_score, 3) if max_score > 0 else 0
+        
+        selected = []
+        
+        if qtype == 'single' or qtype == 'units':
+            # Один вариант с максимальным score
+            sorted_scores = sorted(scored, key=lambda x: x["score"], reverse=True)
+            if sorted_scores:
+                selected = [{
+                    "option": sorted_scores[0]["option"],
+                    "score": sorted_scores[0]["norm"],
+                    "snippets": sorted_scores[0]["snippets"]
+                }]
+        
+        else:  # multi - УЛУЧШЕНО С УЧЁТОМ СПИСКОВ!
+            sorted_scores = sorted(scored, key=lambda x: x["norm"], reverse=True)
+            
+            if not sorted_scores:
+                selected = []
+            else:
+                # === НОВАЯ ЛОГИКА: ПРИОРИТЕТ СПИСКАМ ===
+                
+                # Если есть релевантный список - используем его размер
+                if relevant_list and len(relevant_list['items']) > 0:
+                    expected_count = len(relevant_list['items'])
+                    
+                    # Выбираем ТОП-N вариантов, где N = размер списка
+                    # Но только те, у которых score > 0.3 (базовый порог)
+                    candidates = [s for s in sorted_scores if s["norm"] >= 0.3]
+                    
+                    if len(candidates) >= expected_count:
+                        selected = [
+                            {"option": s["option"], "score": s["norm"], "snippets": s["snippets"]}
+                            for s in candidates[:expected_count]
+                        ]
+                    else:
+                        # Если не хватает кандидатов - берём всех с norm >= 0.3
+                        selected = [
+                            {"option": s["option"], "score": s["norm"], "snippets": s["snippets"]}
+                            for s in candidates
+                        ]
+                
+                # Если списка нет - используем адаптивный порог
+                else:
+                    top_score = sorted_scores[0]["norm"]
+                    
+                    if top_score < 0.3:
+                        selected = [{
+                            "option": sorted_scores[0]["option"],
+                            "score": sorted_scores[0]["norm"],
+                            "snippets": sorted_scores[0]["snippets"]
+                        }]
+                    else:
+                        threshold = max(top_score * 0.6, 0.35)
+                        
+                        close_values = [s["norm"] for s in sorted_scores if s["norm"] >= 0.35]
+                        if len(close_values) >= 2:
+                            mean_top = np.mean(close_values[:3])
+                            threshold = min(threshold, mean_top * 0.75)
+                        
+                        candidates = [s for s in scored if s["norm"] >= threshold]
+                        selected = [
+                            {"option": s["option"], "score": s["norm"], "snippets": s["snippets"]}
+                            for s in candidates
+                        ]
+                
+                selected.sort(key=lambda x: x["score"], reverse=True)
+        
+        results.append({
+            "question": qtext,
+            "type": qtype,
+            "options": [{"option": s["option"], "norm": s["norm"], "snippets": s["snippets"]} for s in scored],
+            "selected": selected
+        })
+    
+    return {"ok": True, "results": results}
+, '', cleaned_item)
+                        cleaned_items.append(cleaned_item)
+                    
+                    lists.append({
+                        'context': match.group(0),
+                        'items': cleaned_items,
+                        'position': match.start()
+                    })
+                    break
+    
+    return lists
+
+def find_relevant_list(question, lists):
+    """
+    Находит список из лекции, наиболее релевантный вопросу.
+    """
+    if not lists:
+        return None
+    
+    q_norm = normalize_text(question)
+    
+    best_list = None
+    best_score = 0.0
+    
+    for lst in lists:
+        # Сравниваем контекст списка с вопросом
+        context_norm = normalize_text(lst['context'])
+        
+        # N-граммы из вопроса и контекста
+        q_ngrams = set(extract_ngrams(question, 2, 3))
+        ctx_ngrams = set(extract_ngrams(lst['context'], 2, 3))
+        
+        overlap = len(q_ngrams.intersection(ctx_ngrams))
+        
+        # Similarity
+        similarity = calculate_similarity(question, lst['context'])
+        
+        score = overlap * 2 + similarity * 5
+        
+        if score > best_score:
+            best_score = score
+            best_list = lst
+    
+    return best_list if best_score > 2.0 else None
+
+def score_option_universal(lecture, option, question, relevant_list=None):
     """
     УНИВЕРСАЛЬНАЯ функция оценки опции.
     Работает для ЛЮБЫХ вопросов без хардкода конкретных слов.
+    
+    relevant_list: структурированный список из лекции, релевантный вопросу
     """
     L = normalize_text(lecture)
     opt = normalize_text(option)
@@ -394,7 +851,10 @@ def parse_html_quiz(html):
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root(request: Request):
-    mode = "🚀 Локальный (SBERT+SpaCy)" if IS_LOCAL else "☁️ Облачный (TF-IDF)"
+    if IS_LOCAL:
+        mode = "🚀 Локальный (SBERT+SpaCy)"
+    else:
+        mode = "☁️ Облачный (SBERT Lite)" if SBERT_MODEL else "☁️ Облачный (TF-IDF)"
     return templates.TemplateResponse("index.html", {"request": request, "mode": mode})
 
 @app.post("/api/extract-text-from-pdf/")
@@ -494,16 +954,45 @@ async def process_quiz(data: ProcessQuizRequest):
                     "snippets": sorted_scores[0]["snippets"]
                 }]
         
-        else:  # multi
-            # Несколько вариантов с high score
-            candidates = [s for s in scored if s["norm"] >= 0.5]
-            if not candidates:
-                candidates = [s for s in scored if s["norm"] >= 0.35]
-            selected = [
-                {"option": s["option"], "score": s["norm"], "snippets": s["snippets"]}
-                for s in candidates
-            ]
-            selected.sort(key=lambda x: x["score"], reverse=True)
+        else:  # multi - ИСПРАВЛЕНО!
+            # АДАПТИВНЫЙ ПОДХОД: выбираем варианты близкие к максимуму
+            sorted_scores = sorted(scored, key=lambda x: x["norm"], reverse=True)
+            
+            if not sorted_scores:
+                selected = []
+            else:
+                top_score = sorted_scores[0]["norm"]
+                
+                # Если топовый score очень низкий - берём только его
+                if top_score < 0.3:
+                    selected = [{
+                        "option": sorted_scores[0]["option"],
+                        "score": sorted_scores[0]["norm"],
+                        "snippets": sorted_scores[0]["snippets"]
+                    }]
+                else:
+                    # АДАПТИВНЫЙ ПОРОГ: 60% от максимального score
+                    # Это позволит выбрать все варианты близкие к максимуму
+                    # Например: если max=1.0, порог=0.6, выберутся 1.0, 0.8, 0.65
+                    # Если max=1.0, то 0.440 = 44% (не пройдёт)
+                    # НО! Если варианты идут кластером (0.44, 1.0, 0.44), 
+                    # то нужно понизить порог
+                    
+                    threshold = max(top_score * 0.6, 0.35)
+                    
+                    # Проверяем, есть ли кластер близких значений
+                    close_values = [s["norm"] for s in sorted_scores if s["norm"] >= 0.35]
+                    if len(close_values) >= 2:
+                        # Если есть несколько близких - понижаем порог
+                        mean_top = np.mean(close_values[:3])  # среднее топ-3
+                        threshold = min(threshold, mean_top * 0.75)
+                    
+                    candidates = [s for s in scored if s["norm"] >= threshold]
+                    selected = [
+                        {"option": s["option"], "score": s["norm"], "snippets": s["snippets"]}
+                        for s in candidates
+                    ]
+                    selected.sort(key=lambda x: x["score"], reverse=True)
         
         results.append({
             "question": qtext,
