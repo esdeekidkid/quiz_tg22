@@ -212,7 +212,7 @@ def extract_lists_from_lecture(lecture):
                         # Берём до первого переноса или до 15 слов
                         words = item.split()[:15]
                         cleaned_item = ' '.join(words)
-                        cleaned_item = re.sub(r'[,;\.]+
+                        cleaned_item = re.sub(r'[,;]+$', '', item).strip()
 
 def find_relevant_list(question, lists):
     """Находит список из лекции, наиболее релевантный вопросу."""
